@@ -641,7 +641,7 @@ def main():
         selections = {}
         for label, col in CATEGORICAL_FILTERS:
             choices = opts.get(col, [])
-            selections[col] = st.multiselect(label, choices, default=[])
+            selections[col] = st.multiselect(label, choices, default=[], placeholder="Include All")
 
         st.divider()
         apply = st.button("Apply Filters", type="primary", use_container_width=True)
