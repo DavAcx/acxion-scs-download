@@ -324,6 +324,7 @@ def get_conn():
 
 
 def run_query(sql: str, params=None) -> pd.DataFrame:
+    """Small queries only (filter options, COUNT).  Do NOT use for full data fetch."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(sql, params or [])
@@ -435,14 +436,6 @@ def count_records(where: str, params: list) -> int:
     return int(df.iloc[0, 0])
 
 
-def fetch_data(where: str, params: list) -> pd.DataFrame:
-    # Alias every column explicitly ("col" AS "col") so the cursor description
-    # always returns the exact mixed-case name, regardless of Snowflake defaults.
-    quoted_cols = ", ".join(f'"{c}" AS "{c}"' for c in ALL_DB_COLS)
-    sql = f'SELECT {quoted_cols} FROM {TABLE} {where} ORDER BY "ActivityDates" DESC'
-    return run_query(sql, params)
-
-
 # ─── Computed columns ─────────────────────────────────────────────────────────
 
 def _as_bool(val) -> bool:
@@ -457,33 +450,90 @@ def _as_bool(val) -> bool:
 
 
 def add_computed_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Add columns that Tableau computes via calculated fields.
+    """Add Tableau calculated-field columns using vectorized operations.
 
-    Must be called after fetch_data() so Sale_is_In_Progress__c and
-    InsideSalesInteractionID are present in the DataFrame.
+    "Sales Result Status"  — Calculation_169940583539675136
+    "Order Not Shipped"    — Calculation_739153323692511235 (GC lens)
     """
-    # "Sales Result Status" — Tableau Calculation_169940583539675136
-    # caption: "Sales Result Status"
-    # IF([SalesResultStatus]='Not Sold' AND [Sale_is_In_Progress__c]=1)
-    #   THEN 'Not Sold In-Progress'
-    # ELSEIF([SalesResultStatus]='Not Sold' AND [Sale_is_In_Progress__c]=0)
-    #   THEN 'Not Sold Final'
-    # ELSE [SalesResultStatus]
-    def _srs(row):
-        if row["SalesResultStatus"] == "Not Sold":
-            return "Not Sold In-Progress" if _as_bool(row["Sale_is_In_Progress__c"]) else "Not Sold Final"
-        return row["SalesResultStatus"]
+    # Vectorised boolean coercion for Sale_is_In_Progress__c
+    ip_col = df["Sale_is_In_Progress__c"]
+    if pd.api.types.is_bool_dtype(ip_col):
+        in_progress = ip_col
+    elif pd.api.types.is_numeric_dtype(ip_col):
+        in_progress = ip_col.astype(bool)
+    else:
+        in_progress = ip_col.map(_as_bool)
 
-    df["Sales Result Status"] = df.apply(_srs, axis=1)
+    not_sold = df["SalesResultStatus"] == "Not Sold"
+    srs = df["SalesResultStatus"].copy()
+    srs = srs.mask(not_sold &  in_progress, "Not Sold In-Progress")
+    srs = srs.mask(not_sold & ~in_progress, "Not Sold Final")
+    df["Sales Result Status"] = srs
 
-    # "Order Not Shipped" — Tableau Calculation_739153323692511235 (GC lens only)
-    # caption: "Order Not Shipped"
     # IIF(IsNull([InsideSalesInteractionID]), 'No', 'Yes')
-    df["Order Not Shipped"] = df["InsideSalesInteractionID"].apply(
-        lambda x: "No" if (x is None or x == "" or (isinstance(x, float) and pd.isna(x))) else "Yes"
-    )
+    iid = df["InsideSalesInteractionID"]
+    is_null = iid.isna() | (iid.astype(str).str.strip().isin(["", "None", "nan"]))
+    df["Order Not Shipped"] = is_null.map({True: "No", False: "Yes"})
 
     return df
+
+
+# ─── Streaming fetch ──────────────────────────────────────────────────────────
+
+def stream_fetch(where: str, params: list, progress_text) -> dict:
+    """Fetch data from Snowflake in chunks and write directly to CSV buffers.
+
+    Processes both download lenses in a single pass so we never hold the full
+    dataset as a DataFrame.  Returns CSV bytes + 100-row preview DataFrames.
+    """
+    conn = get_conn()
+    cur  = conn.cursor()
+
+    quoted_cols = ", ".join(f'"{c}" AS "{c}"' for c in ALL_DB_COLS)
+    sql = f'SELECT {quoted_cols} FROM {TABLE} {where} ORDER BY "ActivityDates" DESC'
+    cur.execute(sql, params or [])
+
+    col_names   = [d[0] for d in cur.description]
+    scs_buf     = io.StringIO()
+    gc_buf      = io.StringIO()
+    scs_preview: list = []
+    gc_preview:  list = []
+    first_chunk = True
+    total_rows  = 0
+    CHUNK       = 10_000
+
+    while True:
+        rows = cur.fetchmany(CHUNK)
+        if not rows:
+            break
+
+        chunk_df = pd.DataFrame(rows, columns=col_names)
+        chunk_df = add_computed_cols(chunk_df)
+        total_rows += len(chunk_df)
+        progress_text.caption(f"⏳ Fetched {total_rows:,} rows…")
+
+        for buf, output_cols, preview_list in [
+            (scs_buf, SCS_OUTPUT_COLS, scs_preview),
+            (gc_buf,  GC_OUTPUT_COLS,  gc_preview),
+        ]:
+            available  = [c for c in output_cols if c in chunk_df.columns]
+            out_chunk  = chunk_df[available]
+            out_chunk.to_csv(buf, index=False, header=first_chunk)
+            if len(preview_list) < 100:
+                remaining = 100 - len(preview_list)
+                preview_list.extend(out_chunk.head(remaining).to_dict("records"))
+
+        first_chunk = False
+
+    cur.close()
+
+    return {
+        "scs_csv":     scs_buf.getvalue().encode("utf-8"),
+        "gc_csv":      gc_buf.getvalue().encode("utf-8"),
+        "scs_preview": pd.DataFrame(scs_preview),
+        "gc_preview":  pd.DataFrame(gc_preview),
+        "total_rows":  total_rows,
+    }
 
 
 # ─── UI ──────────────────────────────────────────────────────────────────────
@@ -545,51 +595,46 @@ def main():
         st.warning("No records match the current filters.")
         return
 
-    if n > 500_000:
-        st.warning(
-            f"⚠️ {n:,} rows matched — exceeds the 500,000-row download limit. "
-            f"Please narrow your filters before fetching."
-        )
-
     st.divider()
 
     # Fetch button
     fetch_col, _ = st.columns([2, 3])
     with fetch_col:
-        if st.button("⬇️ Fetch data", use_container_width=True, disabled=(n > 500_000)):
-            with st.spinner(f"Fetching {n:,} rows from Snowflake…"):
-                raw_df = fetch_data(where, params)
-                st.session_state["df"] = add_computed_cols(raw_df)
-            st.success(f"Ready — {len(st.session_state['df']):,} rows loaded.")
+        do_fetch = st.button("⬇️ Fetch data", use_container_width=True)
 
-    df: pd.DataFrame | None = st.session_state.get("df")
-    if df is None or len(df) == 0:
+    if do_fetch:
+        progress_text = st.empty()
+        with st.spinner(f"Streaming {n:,} rows from Snowflake…"):
+            result = stream_fetch(where, params, progress_text)
+        progress_text.empty()
+        st.session_state["fetch_result"] = result
+        st.success(f"Ready — {result['total_rows']:,} rows fetched.")
+
+    result = st.session_state.get("fetch_result")
+    if result is None:
         return
+
+    total_rows = result["total_rows"]
 
     # ── Download tabs — one per dashboard lens ───────────────────────────────
     st.subheader("Download")
     tab_scs, tab_gc = st.tabs(["Sales Call Summary", "GC Sales Call Summary"])
 
-    for tab, output_cols, lens_name in [
-        (tab_scs, SCS_OUTPUT_COLS, "Sales Call Summary"),
-        (tab_gc,  GC_OUTPUT_COLS,  "GC Sales Call Summary"),
+    for tab, csv_key, preview_key, lens_name, output_cols in [
+        (tab_scs, "scs_csv", "scs_preview", "Sales Call Summary",    SCS_OUTPUT_COLS),
+        (tab_gc,  "gc_csv",  "gc_preview",  "GC Sales Call Summary", GC_OUTPUT_COLS),
     ]:
         with tab:
-            available = [c for c in output_cols if c in df.columns]
-            missing   = [c for c in output_cols if c not in df.columns]
-            if missing:
-                st.warning(f"⚠️ Columns not yet in data source and will be omitted: {missing}")
-
-            out_df    = df[available]
-            safe_name = lens_name.lower().replace(" ", "_")
+            csv_bytes  = result[csv_key]
+            preview_df = result[preview_key]
+            safe_name  = lens_name.lower().replace(" ", "_")
+            n_cols     = len([c for c in output_cols if c in (list(preview_df.columns) + ["Sales Result Status", "Order Not Shipped"])])
 
             dl_col, info_col = st.columns([2, 3])
             with dl_col:
-                csv_buf = io.StringIO()
-                out_df.to_csv(csv_buf, index=False)
                 st.download_button(
-                    label=f"⬇️ Download CSV  ({len(out_df):,} rows × {len(available)} cols)",
-                    data=csv_buf.getvalue(),
+                    label=f"⬇️ Download CSV  ({total_rows:,} rows × {n_cols} cols)",
+                    data=csv_bytes,
                     file_name=f"{safe_name}_{date_start}_{date_end}.csv",
                     mime="text/csv",
                     use_container_width=True,
@@ -598,12 +643,12 @@ def main():
                 )
             with info_col:
                 st.caption(
-                    f"{len(available)} columns · column order matches "
+                    f"{len(preview_df.columns)} columns · column order matches "
                     f"the Tableau **{lens_name}** worksheet"
                 )
 
             with st.expander("Preview (first 100 rows)", expanded=False):
-                st.dataframe(out_df.head(100), use_container_width=True)
+                st.dataframe(preview_df, use_container_width=True)
 
 
 if __name__ == "__main__":
