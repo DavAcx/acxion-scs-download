@@ -634,7 +634,7 @@ def main():
             value=(date_max - timedelta(days=90), date_max),
             min_value=date_min,
             max_value=date_max,
-            format="MM/DD/YY",
+            format="MM/DD/YYYY",
             help="Filters on the ActivityDates column (= DateCompleted if set, else StartDate).",
         )
 
