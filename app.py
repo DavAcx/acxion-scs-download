@@ -327,17 +327,16 @@ LENS_COLS = {
 
 # Categorical filters: (sidebar label, Snowflake column name)
 CATEGORICAL_FILTERS = [
-    ("Status",                "Status"),
-    ("Source",                "Source"),
-    ("Employee",              "Employee"),
-    ("Geographic Market",     "GeographicMarket"),
-    ("Corporate Affiliation", "CorporateAffiliation__c"),
-    ("Customer Type",         "CustomerType"),
-    ("Segment",               "SegmentName"),
-    ("Sub-Segment",           "SubSegmentName"),
-    ("Client (Manufacturer)", "Client"),
-    ("Affiliation",           "Affiliation"),
-    ("Sales Result Status",   "_SalesResultStatus"),  # derived — handled specially
+    ("Sales Call Status",                 "Status"),
+    ("Sales Rep",                         "Employee"),
+    ("Geographic Market",                 "GeographicMarket"),
+    ("Distributor Corporate Affiliation", "CorporateAffiliation__c"),
+    ("Customer Type",                     "CustomerType"),
+    ("Operator Segment",                  "SegmentName"),
+    ("Operator Sub-Segment",              "SubSegmentName"),
+    ("Client (Manufacturer)",             "Client"),
+    ("Affiliation",                       "Affiliation"),
+    ("Sales Result Status",               "_SalesResultStatus"),  # derived — handled specially
 ]
 
 
@@ -616,6 +615,8 @@ def main():
 
     # ── Sidebar filters ──────────────────────────────────────────────────────
     with st.sidebar:
+        st.image("acxion_logo.svg", use_container_width=True)
+        st.divider()
         st.header("Filters")
 
         # Output file type must be chosen first — it determines which CSV is built
@@ -633,6 +634,7 @@ def main():
             value=(date_max - timedelta(days=90), date_max),
             min_value=date_min,
             max_value=date_max,
+            format="MM/DD/YY",
             help="Filters on the ActivityDates column (= DateCompleted if set, else StartDate).",
         )
 
