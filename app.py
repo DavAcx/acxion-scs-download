@@ -2,18 +2,22 @@
 Sales Call Summary Download
 Streamlit app — lets users apply filters and download matching rows as CSV.
 
-Two download formats that exactly match the Tableau dashboard lenses
+Three download formats that exactly match the Tableau dashboard lenses
 (field names and left-to-right column order):
-  • Sales Call Summary        (53 columns)
-  • GC Sales Call Summary     (52 columns)
+  • Sales Call Summary                      (53 columns)
+  • GameChanger Fields Sales Call Summary   (55 columns)
+  • Not Sold Responses                      (36 columns)
 
-Computed columns reproduce two Tableau calculated fields inline:
+Computed columns reproduce Tableau calculated fields inline:
   • "Sales Result Status"  — Calculation_169940583539675136
       IF SalesResultStatus='Not Sold' AND Sale_is_In_Progress__c THEN 'Not Sold In-Progress'
       ELSEIF SalesResultStatus='Not Sold' THEN 'Not Sold Final'
       ELSE SalesResultStatus
   • "Order Not Shipped"    — Calculation_739153323692511235 (GC lens only)
       IIF(IsNull(InsideSalesInteractionID), 'No', 'Yes')
+  • "Created By"           — Calculation_1055583495942146  (GC lens only)  = Employee
+  • "Created Date"         — Calculation_1055583495303169  (GC lens only)  = StartDate
+  • "Dist Geo Mkt"         — Calculation_1055583494795264  (GC lens only)  = GeographicMarket
 
 Data source: INTEGRATE_IO_DATABASE.RPTDB."SalesCallSummary" (Snowflake)
 Credentials: stored in .streamlit/secrets.toml (never committed to git)
@@ -212,13 +216,17 @@ SCS_OUTPUT_COLS = [
     "OperatorID",
 ]
 
-# ── "GC Sales Call Summary" lens ──────────────────────────────────────────────
-# "Sales Result Status" and "Order Not Shipped" are computed columns.
+# ── "GameChanger Fields Sales Call Summary" lens ──────────────────────────────
+# "Sales Result Status", "Order Not Shipped", "Created By", "Created Date", and
+# "Dist Geo Mkt" are computed columns; see add_computed_cols().
 GC_OUTPUT_COLS = [
+    "Created By",                  # computed — Tableau Calculation_1055583495942146 = Employee
+    "Created Date",                # computed — Tableau Calculation_1055583495303169 = StartDate
     "Employee",
     "Status",
     "StartDate",
     "DateCompleted",
+    "Dist Geo Mkt",                # computed — Tableau Calculation_1055583494795264 = GeographicMarket
     "GeographicMarket",
     "Zone",
     "CustomerType",
@@ -238,12 +246,12 @@ GC_OUTPUT_COLS = [
     "Number_of_Operator_Units__c",
     "EstimatedWeeklyCasePotential",
     "SalesResultStatus",
-    "Sales Result Status",        # computed — Tableau Calculation_169940583539675136
+    "Sales Result Status",         # computed — Tableau Calculation_169940583539675136
     "PipelineRelatedCall__c",
     "BigHitVerified",
     "BigHitAuditID",
     "BigHitVerificationType",
-    "Order Not Shipped",          # computed — Tableau Calculation_739153323692511235
+    "Order Not Shipped",           # computed — Tableau Calculation_739153323692511235
     "InsideSalesNotes",
     "t_NotSoldReason__c",
     "OperatorUnwillingtoConsiderFeedback",
@@ -268,6 +276,54 @@ GC_OUTPUT_COLS = [
     "CommOrder18_ID__c",
     "OperatorID",
 ]
+
+# ── "Not Sold Responses" lens ─────────────────────────────────────────────────
+# "Sales Result Status" is a computed column; see add_computed_cols().
+NS_OUTPUT_COLS = [
+    "Employee",
+    "DateCompleted",
+    "GeographicMarket",
+    "Zone",
+    "CustomerType",
+    "LLO",
+    "OperatorName",
+    "OnBehalfofDistributor",
+    "Client",
+    "ProductPresented",
+    "ProductSKU",
+    "ProductBrand",
+    "ProductCategory",
+    "ProductPkSz",
+    "EstimatedWeeklyCasePotential",
+    "Sales Result Status",         # computed — Tableau Calculation_169940583539675136
+    "SalesCallSummaryNotes",
+    "t_NotSoldReason__c",
+    "WhataretheNextSteps",
+    "Who_needs_to_review_product_at_Operator__c",
+    "OperatorFeedback__c",
+    "Specific_Issue__c",
+    "Quality_Issue__c",
+    "Not_Sold_Price__c",
+    "Reasons_unwilling_to_consider__c",
+    "FeedbackElaboration",
+    "Was_a_cutting_conducted__c",
+    "Where_do_we_need_to_get_pricing__c",
+    "Who_Was_Distributor_Name__c",
+    "Will_Client_pay_slotting_fee__c",
+    "What_is_the_allowance_per_case_needed__c",
+    "Marketing_program_exist__c",
+    "Is_operator_under_contract__c",
+    "Operator_Contract_Expiry_Date__c",
+    "SalesForceActivityID",
+    "OperatorID",
+]
+
+# Map display name → output column list (used by stream_fetch and UI)
+LENS_COLS = {
+    "Sales Call Summary":                    SCS_OUTPUT_COLS,
+    "GameChanger Fields Sales Call Summary": GC_OUTPUT_COLS,
+    "Not Sold Responses":                    NS_OUTPUT_COLS,
+}
 
 # Categorical filters: (sidebar label, Snowflake column name)
 CATEGORICAL_FILTERS = [
@@ -452,8 +508,11 @@ def _as_bool(val) -> bool:
 def add_computed_cols(df: pd.DataFrame) -> pd.DataFrame:
     """Add Tableau calculated-field columns using vectorized operations.
 
-    "Sales Result Status"  — Calculation_169940583539675136
-    "Order Not Shipped"    — Calculation_739153323692511235 (GC lens)
+    "Sales Result Status"  — Calculation_169940583539675136       (all lenses)
+    "Order Not Shipped"    — Calculation_739153323692511235        (GC lens)
+    "Created By"           — Calculation_1055583495942146 = Employee    (GC lens)
+    "Created Date"         — Calculation_1055583495303169 = StartDate   (GC lens)
+    "Dist Geo Mkt"         — Calculation_1055583494795264 = GeographicMarket (GC lens)
     """
     # Vectorised boolean coercion for Sale_is_In_Progress__c
     ip_col = df["Sale_is_In_Progress__c"]
@@ -475,17 +534,30 @@ def add_computed_cols(df: pd.DataFrame) -> pd.DataFrame:
     is_null = iid.isna() | (iid.astype(str).str.strip().isin(["", "None", "nan"]))
     df["Order Not Shipped"] = is_null.map({True: "No", False: "Yes"})
 
+    # GC pass-through alias columns
+    df["Created By"]   = df["Employee"]
+    df["Created Date"] = df["StartDate"]
+    df["Dist Geo Mkt"] = df["GeographicMarket"]
+
     return df
 
 
 # ─── Streaming fetch ──────────────────────────────────────────────────────────
 
-def stream_fetch(where: str, params: list, progress_text) -> dict:
-    """Fetch data from Snowflake in chunks and write directly to CSV buffers.
+def stream_fetch(where: str, params: list, lens: str, progress_text) -> dict:
+    """Fetch data from Snowflake in chunks and write directly to a CSV buffer.
 
-    Processes both download lenses in a single pass so we never hold the full
-    dataset as a DataFrame.  Returns CSV bytes + 100-row preview DataFrames.
+    Only generates output for the selected lens so we minimise memory usage.
+    Returns CSV bytes + a 100-row preview DataFrame.
+
+    Args:
+        where:         SQL WHERE clause (may be empty string)
+        params:        Bind parameters matching placeholders in `where`
+        lens:          One of the LENS_COLS keys (display name)
+        progress_text: st.empty() placeholder for streaming progress captions
     """
+    output_cols = LENS_COLS[lens]
+
     conn = get_conn()
     cur  = conn.cursor()
 
@@ -494,10 +566,8 @@ def stream_fetch(where: str, params: list, progress_text) -> dict:
     cur.execute(sql, params or [])
 
     col_names   = [d[0] for d in cur.description]
-    scs_buf     = io.StringIO()
-    gc_buf      = io.StringIO()
-    scs_preview: list = []
-    gc_preview:  list = []
+    buf         = io.StringIO()
+    preview_rows: list = []
     first_chunk = True
     total_rows  = 0
     CHUNK       = 10_000
@@ -512,27 +582,22 @@ def stream_fetch(where: str, params: list, progress_text) -> dict:
         total_rows += len(chunk_df)
         progress_text.caption(f"⏳ Fetched {total_rows:,} rows…")
 
-        for buf, output_cols, preview_list in [
-            (scs_buf, SCS_OUTPUT_COLS, scs_preview),
-            (gc_buf,  GC_OUTPUT_COLS,  gc_preview),
-        ]:
-            available  = [c for c in output_cols if c in chunk_df.columns]
-            out_chunk  = chunk_df[available]
-            out_chunk.to_csv(buf, index=False, header=first_chunk)
-            if len(preview_list) < 100:
-                remaining = 100 - len(preview_list)
-                preview_list.extend(out_chunk.head(remaining).to_dict("records"))
+        available  = [c for c in output_cols if c in chunk_df.columns]
+        out_chunk  = chunk_df[available]
+        out_chunk.to_csv(buf, index=False, header=first_chunk)
+        if len(preview_rows) < 100:
+            remaining = 100 - len(preview_rows)
+            preview_rows.extend(out_chunk.head(remaining).to_dict("records"))
 
         first_chunk = False
 
     cur.close()
 
     return {
-        "scs_csv":     scs_buf.getvalue().encode("utf-8"),
-        "gc_csv":      gc_buf.getvalue().encode("utf-8"),
-        "scs_preview": pd.DataFrame(scs_preview),
-        "gc_preview":  pd.DataFrame(gc_preview),
-        "total_rows":  total_rows,
+        "csv":        buf.getvalue().encode("utf-8"),
+        "preview_df": pd.DataFrame(preview_rows),
+        "total_rows": total_rows,
+        "lens":       lens,
     }
 
 
@@ -552,6 +617,16 @@ def main():
     # ── Sidebar filters ──────────────────────────────────────────────────────
     with st.sidebar:
         st.header("Filters")
+
+        # Output file type must be chosen first — it determines which CSV is built
+        lens = st.radio(
+            "Output File Type",
+            options=list(LENS_COLS.keys()),
+            index=0,
+            help="Selects which Tableau dashboard lens the downloaded CSV will match.",
+        )
+
+        st.divider()
 
         date_start, date_end = st.date_input(
             "Activity Date Range",
@@ -576,12 +651,19 @@ def main():
 
     if apply:
         where, params = build_where(date_start, date_end, selections)
-        st.session_state["last_where"]  = where
-        st.session_state["last_params"] = params
-        st.session_state["df"]          = None   # clear stale data
+        st.session_state["last_where"]       = where
+        st.session_state["last_params"]      = params
+        st.session_state["last_lens"]        = lens
+        st.session_state["fetch_result"]     = None   # clear stale data
     else:
         where  = st.session_state["last_where"]
         params = st.session_state["last_params"]
+
+    # If the user changes the lens without re-applying, clear the old result
+    # so they don't accidentally download the wrong format.
+    if st.session_state.get("last_lens") != lens:
+        st.session_state["fetch_result"] = None
+        st.session_state["last_lens"]    = lens
 
     # Record count
     with st.spinner("Counting matching records…"):
@@ -605,50 +687,53 @@ def main():
     if do_fetch:
         progress_text = st.empty()
         with st.spinner(f"Streaming {n:,} rows from Snowflake…"):
-            result = stream_fetch(where, params, progress_text)
+            result = stream_fetch(where, params, lens, progress_text)
         progress_text.empty()
         st.session_state["fetch_result"] = result
+        st.session_state["last_lens"]    = lens
         st.success(f"Ready — {result['total_rows']:,} rows fetched.")
 
     result = st.session_state.get("fetch_result")
     if result is None:
         return
 
+    # Guard: stale result is for a different lens — tell user to re-fetch
+    if result.get("lens") != lens:
+        st.info(
+            f"Output File Type changed to **{lens}**. "
+            "Click **⬇️ Fetch data** again to generate the new download."
+        )
+        return
+
     total_rows = result["total_rows"]
+    csv_bytes  = result["csv"]
+    preview_df = result["preview_df"]
+    output_cols = LENS_COLS[lens]
 
-    # ── Download tabs — one per dashboard lens ───────────────────────────────
+    # ── Download ─────────────────────────────────────────────────────────────
     st.subheader("Download")
-    tab_scs, tab_gc = st.tabs(["Sales Call Summary", "GC Sales Call Summary"])
+    safe_name = lens.lower().replace(" ", "_")
+    n_cols    = len(preview_df.columns)
 
-    for tab, csv_key, preview_key, lens_name, output_cols in [
-        (tab_scs, "scs_csv", "scs_preview", "Sales Call Summary",    SCS_OUTPUT_COLS),
-        (tab_gc,  "gc_csv",  "gc_preview",  "GC Sales Call Summary", GC_OUTPUT_COLS),
-    ]:
-        with tab:
-            csv_bytes  = result[csv_key]
-            preview_df = result[preview_key]
-            safe_name  = lens_name.lower().replace(" ", "_")
-            n_cols     = len([c for c in output_cols if c in (list(preview_df.columns) + ["Sales Result Status", "Order Not Shipped"])])
+    dl_col, info_col = st.columns([2, 3])
+    with dl_col:
+        st.download_button(
+            label=f"⬇️ Download CSV  ({total_rows:,} rows × {n_cols} cols)",
+            data=csv_bytes,
+            file_name=f"{safe_name}_{date_start}_{date_end}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            type="primary",
+            key="dl_csv",
+        )
+    with info_col:
+        st.caption(
+            f"{n_cols} columns · column order matches "
+            f"the Tableau **{lens}** worksheet"
+        )
 
-            dl_col, info_col = st.columns([2, 3])
-            with dl_col:
-                st.download_button(
-                    label=f"⬇️ Download CSV  ({total_rows:,} rows × {n_cols} cols)",
-                    data=csv_bytes,
-                    file_name=f"{safe_name}_{date_start}_{date_end}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    type="primary",
-                    key=f"dl_{safe_name}",
-                )
-            with info_col:
-                st.caption(
-                    f"{len(preview_df.columns)} columns · column order matches "
-                    f"the Tableau **{lens_name}** worksheet"
-                )
-
-            with st.expander("Preview (first 100 rows)", expanded=False):
-                st.dataframe(preview_df, use_container_width=True)
+    with st.expander("Preview (first 100 rows)", expanded=False):
+        st.dataframe(preview_df, use_container_width=True)
 
 
 if __name__ == "__main__":
