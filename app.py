@@ -25,6 +25,7 @@ Deploy:       Streamlit Community Cloud → main file = streamlit/app.py
 """
 
 import io
+import json
 from datetime import date, timedelta
 
 import pandas as pd
@@ -491,6 +492,86 @@ def count_records(where: str, params: list) -> int:
     return int(df.iloc[0, 0])
 
 
+# ─── Saved views (per-user, persisted in Snowflake) ───────────────────────────
+
+VIEWS_TABLE = 'INTEGRATE_IO_DATABASE.RPTDB."UserSavedViews"'
+
+
+def ensure_views_table() -> None:
+    """Create the UserSavedViews table if it doesn't already exist (idempotent)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {VIEWS_TABLE} (
+            user_email  VARCHAR(255)  NOT NULL,
+            view_name   VARCHAR(255)  NOT NULL,
+            view_config VARIANT       NOT NULL,
+            created_at  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            CONSTRAINT pk_user_saved_views PRIMARY KEY (user_email, view_name)
+        )
+    """)
+    cur.close()
+
+
+def load_user_views(email: str) -> dict:
+    """Return {view_name: config_dict} for the given user.
+
+    Cached in session_state to avoid a Snowflake round-trip on every re-render.
+    Call _invalidate_views_cache(email) after any write to force a fresh load.
+    """
+    cache_key = f"_user_views_{email}"
+    if cache_key not in st.session_state:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            f'SELECT view_name, view_config FROM {VIEWS_TABLE} '
+            f'WHERE user_email = %s ORDER BY view_name',
+            [email],
+        )
+        rows = cur.fetchall()
+        cur.close()
+        result = {}
+        for view_name, config in rows:
+            if isinstance(config, str):
+                config = json.loads(config)
+            result[view_name] = config
+        st.session_state[cache_key] = result
+    return st.session_state[cache_key]
+
+
+def _invalidate_views_cache(email: str) -> None:
+    st.session_state.pop(f"_user_views_{email}", None)
+
+
+def save_user_view(email: str, name: str, config: dict) -> None:
+    """Upsert a named saved view for the user."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute(
+        f'DELETE FROM {VIEWS_TABLE} WHERE user_email = %s AND view_name = %s',
+        [email, name],
+    )
+    cur.execute(
+        f'INSERT INTO {VIEWS_TABLE} (user_email, view_name, view_config) '
+        f'VALUES (%s, %s, PARSE_JSON(%s))',
+        [email, name, json.dumps(config)],
+    )
+    cur.close()
+    _invalidate_views_cache(email)
+
+
+def delete_user_view(email: str, name: str) -> None:
+    """Delete a named saved view for the user."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute(
+        f'DELETE FROM {VIEWS_TABLE} WHERE user_email = %s AND view_name = %s',
+        [email, name],
+    )
+    cur.close()
+    _invalidate_views_cache(email)
+
+
 # ─── Computed columns ─────────────────────────────────────────────────────────
 
 def _as_bool(val) -> bool:
@@ -603,48 +684,146 @@ def stream_fetch(where: str, params: list, lens: str, progress_text) -> dict:
 # ─── UI ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── Authentication ───────────────────────────────────────────────────────
+    if not st.user.is_logged_in:
+        st.title("📥 Sales Call Summary Download")
+        col_logo, _ = st.columns([1, 3])
+        with col_logo:
+            st.image("acxion_logo.svg", use_container_width=True)
+        st.info("Sign in with your Microsoft account to access the app.")
+        st.button("🔐 Sign in with Microsoft", on_click=st.login, args=("microsoft",), type="primary")
+        return
+
+    user_email = st.user.email
+    user_name  = getattr(st.user, "name", None) or user_email
+
+    # Ensure the UserSavedViews table exists (CREATE TABLE IF NOT EXISTS — cheap no-op if present)
+    ensure_views_table()
+
     st.title("📥 Sales Call Summary Download")
     st.caption("Filter the sales call data and download matching rows as CSV.")
 
-    # Load options (cached)
+    # Load filter options (cached 24 h)
     with st.spinner("Loading filter options…"):
         opts = load_filter_options()
 
     date_min = opts["_date_min"] or date.today() - timedelta(days=365)
     date_max = opts["_date_max"] or date.today()
 
-    # ── Sidebar filters ──────────────────────────────────────────────────────
+    # Consume any pending view load (set by "Load" button below)
+    pending_view = st.session_state.pop("_pending_view", None)
+
+    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
         st.image("acxion_logo.svg", use_container_width=True)
         st.divider()
+
+        # User identity + sign-out
+        st.caption(f"👤 {user_name}")
+        st.button("Sign out", on_click=st.logout, use_container_width=True)
+        st.divider()
+
+        # ── Saved views ──────────────────────────────────────────────────────
+        st.subheader("📁 Saved Views")
+        user_views = load_user_views(user_email)
+        view_names = list(user_views.keys())
+
+        if view_names:
+            selected_view = st.selectbox(
+                "Saved views",
+                view_names,
+                index=None,
+                placeholder="Select a view…",
+                label_visibility="collapsed",
+            )
+            load_col, del_col = st.columns(2)
+            with load_col:
+                if st.button("Load", use_container_width=True, disabled=selected_view is None):
+                    st.session_state["_pending_view"] = user_views[selected_view]
+                    st.rerun()
+            with del_col:
+                if st.button("Delete", use_container_width=True, disabled=selected_view is None):
+                    delete_user_view(user_email, selected_view)
+                    st.toast(f"Deleted '{selected_view}'")
+                    st.rerun()
+        else:
+            st.caption("No saved views yet — apply filters and use **Save View** below.")
+
+        st.divider()
+
+        # ── Filters ──────────────────────────────────────────────────────────
         st.header("Filters")
 
-        # Output file type must be chosen first — it determines which CSV is built
+        # Output File Type — resolve default from pending view if any
+        lens_options  = list(LENS_COLS.keys())
+        lens_default  = 0
+        if pending_view:
+            pv_lens = pending_view.get("lens", lens_options[0])
+            if pv_lens in lens_options:
+                lens_default = lens_options.index(pv_lens)
+
         lens = st.radio(
             "Output File Type",
-            options=list(LENS_COLS.keys()),
-            index=0,
+            options=lens_options,
+            index=lens_default,
             help="Selects which Tableau dashboard lens the downloaded CSV will match.",
         )
 
         st.divider()
 
+        # Date range — clamp saved dates to valid min/max
+        if pending_view:
+            try:
+                pv_start = date.fromisoformat(pending_view["date_start"])
+                pv_end   = date.fromisoformat(pending_view["date_end"])
+                pv_start = max(date_min, min(pv_start, date_max))
+                pv_end   = max(date_min, min(pv_end,   date_max))
+            except (KeyError, ValueError):
+                pv_start, pv_end = date_max - timedelta(days=90), date_max
+        else:
+            pv_start, pv_end = date_max - timedelta(days=90), date_max
+
         date_start, date_end = st.date_input(
             "Activity Date Range",
-            value=(date_max - timedelta(days=90), date_max),
+            value=(pv_start, pv_end),
             min_value=date_min,
             max_value=date_max,
             format="MM/DD/YYYY",
             help="Filters on the ActivityDates column (= DateCompleted if set, else StartDate).",
         )
 
+        # Categorical filters — pre-populate from pending view if any
         selections = {}
         for label, col in CATEGORICAL_FILTERS:
             choices = opts.get(col, [])
-            selections[col] = st.multiselect(label, choices, default=[], placeholder="Include All")
+            if pending_view:
+                pv_default = [v for v in pending_view.get("selections", {}).get(col, []) if v in choices]
+            else:
+                pv_default = []
+            selections[col] = st.multiselect(label, choices, default=pv_default, placeholder="Include All")
 
         st.divider()
         apply = st.button("Apply Filters", type="primary", use_container_width=True)
+
+        # ── Save current view ─────────────────────────────────────────────────
+        st.divider()
+        st.subheader("💾 Save View")
+        view_name_input = st.text_input(
+            "View name",
+            placeholder="e.g. My Region Q2",
+            label_visibility="collapsed",
+        )
+        if st.button("Save current filters as view", use_container_width=True,
+                     disabled=not view_name_input.strip()):
+            config = {
+                "lens":       lens,
+                "date_start": date_start.isoformat(),
+                "date_end":   date_end.isoformat(),
+                "selections": {col: selections[col] for _, col in CATEGORICAL_FILTERS},
+            }
+            save_user_view(user_email, view_name_input.strip(), config)
+            st.toast(f"✅ Saved '{view_name_input.strip()}'")
+            st.rerun()
 
     # ── Main area ────────────────────────────────────────────────────────────
     if not apply and "last_where" not in st.session_state:
@@ -653,16 +832,15 @@ def main():
 
     if apply:
         where, params = build_where(date_start, date_end, selections)
-        st.session_state["last_where"]       = where
-        st.session_state["last_params"]      = params
-        st.session_state["last_lens"]        = lens
-        st.session_state["fetch_result"]     = None   # clear stale data
+        st.session_state["last_where"]   = where
+        st.session_state["last_params"]  = params
+        st.session_state["last_lens"]    = lens
+        st.session_state["fetch_result"] = None   # clear stale data
     else:
         where  = st.session_state["last_where"]
         params = st.session_state["last_params"]
 
-    # If the user changes the lens without re-applying, clear the old result
-    # so they don't accidentally download the wrong format.
+    # Clear stale download if lens changed without re-applying
     if st.session_state.get("last_lens") != lens:
         st.session_state["fetch_result"] = None
         st.session_state["last_lens"]    = lens
@@ -707,10 +885,9 @@ def main():
         )
         return
 
-    total_rows = result["total_rows"]
-    csv_bytes  = result["csv"]
-    preview_df = result["preview_df"]
-    output_cols = LENS_COLS[lens]
+    total_rows  = result["total_rows"]
+    csv_bytes   = result["csv"]
+    preview_df  = result["preview_df"]
 
     # ── Download ─────────────────────────────────────────────────────────────
     st.subheader("Download")
