@@ -684,22 +684,6 @@ def stream_fetch(where: str, params: list, lens: str, progress_text) -> dict:
 # ─── UI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Authentication ───────────────────────────────────────────────────────
-    if not st.user.is_logged_in:
-        st.title("📥 Sales Call Summary Download")
-        col_logo, _ = st.columns([1, 3])
-        with col_logo:
-            st.image("acxion_logo.svg", use_container_width=True)
-        st.info("Sign in with your Microsoft account to access the app.")
-        st.button("🔐 Sign in with Microsoft", on_click=st.login, args=("microsoft",), type="primary")
-        return
-
-    user_email = st.user.email
-    user_name  = getattr(st.user, "name", None) or user_email
-
-    # Ensure the UserSavedViews table exists (CREATE TABLE IF NOT EXISTS — cheap no-op if present)
-    ensure_views_table()
-
     st.title("📥 Sales Call Summary Download")
     st.caption("Filter the sales call data and download matching rows as CSV.")
 
@@ -710,6 +694,11 @@ def main():
     date_min = opts["_date_min"] or date.today() - timedelta(days=365)
     date_max = opts["_date_max"] or date.today()
 
+    # Ensure the UserSavedViews table exists once per session
+    if "views_table_ensured" not in st.session_state:
+        ensure_views_table()
+        st.session_state["views_table_ensured"] = True
+
     # Consume any pending view load (set by "Load" button below)
     pending_view = st.session_state.pop("_pending_view", None)
 
@@ -718,36 +707,43 @@ def main():
         st.image("acxion_logo.svg", use_container_width=True)
         st.divider()
 
-        # User identity + sign-out
-        st.caption(f"👤 {user_name}")
-        st.button("Sign out", on_click=st.logout, use_container_width=True)
-        st.divider()
+        # ── Identity ─────────────────────────────────────────────────────────
+        rep_names = opts.get("Employee", [])
+        user_name = st.selectbox(
+            "Who are you?",
+            options=rep_names,
+            index=None,
+            placeholder="Select your name…",
+            key="user_identity",
+        )
 
-        # ── Saved views ──────────────────────────────────────────────────────
-        st.subheader("📁 Saved Views")
-        user_views = load_user_views(user_email)
-        view_names = list(user_views.keys())
+        # ── Saved views (only shown once a name is selected) ─────────────────
+        if user_name:
+            st.divider()
+            st.subheader("📁 Saved Views")
+            user_views = load_user_views(user_name)
+            view_names = list(user_views.keys())
 
-        if view_names:
-            selected_view = st.selectbox(
-                "Saved views",
-                view_names,
-                index=None,
-                placeholder="Select a view…",
-                label_visibility="collapsed",
-            )
-            load_col, del_col = st.columns(2)
-            with load_col:
-                if st.button("Load", use_container_width=True, disabled=selected_view is None):
-                    st.session_state["_pending_view"] = user_views[selected_view]
-                    st.rerun()
-            with del_col:
-                if st.button("Delete", use_container_width=True, disabled=selected_view is None):
-                    delete_user_view(user_email, selected_view)
-                    st.toast(f"Deleted '{selected_view}'")
-                    st.rerun()
-        else:
-            st.caption("No saved views yet — apply filters and use **Save View** below.")
+            if view_names:
+                selected_view = st.selectbox(
+                    "Saved views",
+                    view_names,
+                    index=None,
+                    placeholder="Select a view…",
+                    label_visibility="collapsed",
+                )
+                load_col, del_col = st.columns(2)
+                with load_col:
+                    if st.button("Load", use_container_width=True, disabled=selected_view is None):
+                        st.session_state["_pending_view"] = user_views[selected_view]
+                        st.rerun()
+                with del_col:
+                    if st.button("Delete", use_container_width=True, disabled=selected_view is None):
+                        delete_user_view(user_name, selected_view)
+                        st.toast(f"Deleted '{selected_view}'")
+                        st.rerun()
+            else:
+                st.caption("No saved views yet — apply filters and use **Save View** below.")
 
         st.divider()
 
@@ -755,8 +751,8 @@ def main():
         st.header("Filters")
 
         # Output File Type — resolve default from pending view if any
-        lens_options  = list(LENS_COLS.keys())
-        lens_default  = 0
+        lens_options = list(LENS_COLS.keys())
+        lens_default = 0
         if pending_view:
             pv_lens = pending_view.get("lens", lens_options[0])
             if pv_lens in lens_options:
@@ -805,25 +801,26 @@ def main():
         st.divider()
         apply = st.button("Apply Filters", type="primary", use_container_width=True)
 
-        # ── Save current view ─────────────────────────────────────────────────
-        st.divider()
-        st.subheader("💾 Save View")
-        view_name_input = st.text_input(
-            "View name",
-            placeholder="e.g. My Region Q2",
-            label_visibility="collapsed",
-        )
-        if st.button("Save current filters as view", use_container_width=True,
-                     disabled=not view_name_input.strip()):
-            config = {
-                "lens":       lens,
-                "date_start": date_start.isoformat(),
-                "date_end":   date_end.isoformat(),
-                "selections": {col: selections[col] for _, col in CATEGORICAL_FILTERS},
-            }
-            save_user_view(user_email, view_name_input.strip(), config)
-            st.toast(f"✅ Saved '{view_name_input.strip()}'")
-            st.rerun()
+        # ── Save current view (only shown once a name is selected) ────────────
+        if user_name:
+            st.divider()
+            st.subheader("💾 Save View")
+            view_name_input = st.text_input(
+                "View name",
+                placeholder="e.g. My Region Q2",
+                label_visibility="collapsed",
+            )
+            if st.button("Save current filters as view", use_container_width=True,
+                         disabled=not view_name_input.strip()):
+                config = {
+                    "lens":       lens,
+                    "date_start": date_start.isoformat(),
+                    "date_end":   date_end.isoformat(),
+                    "selections": {col: selections[col] for _, col in CATEGORICAL_FILTERS},
+                }
+                save_user_view(user_name, view_name_input.strip(), config)
+                st.toast(f"✅ Saved '{view_name_input.strip()}'")
+                st.rerun()
 
     # ── Main area ────────────────────────────────────────────────────────────
     if not apply and "last_where" not in st.session_state:
